@@ -201,3 +201,129 @@ def test_gpu_release_rejects_structured_escrow_secret(tmp_path):
     assert response.get_json() == {"error": "escrow_secret must be a string"}
     assert _balance(db_path, "victim") == 20.0
     assert _balance(db_path, "attacker") == 0.0
+
+
+def _init_attest_db(db_path):
+    """Create DB with gpu_attestations table for attest tests."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gpu_attestations (
+                miner_id TEXT PRIMARY KEY,
+                gpu_model TEXT,
+                vram_gb INTEGER,
+                cuda_version TEXT,
+                benchmark_score INTEGER,
+                price_render_minute REAL,
+                price_tts_1k_chars REAL,
+                price_stt_minute REAL,
+                price_llm_1k_tokens REAL,
+                supports_render INTEGER,
+                supports_tts INTEGER,
+                supports_stt INTEGER,
+                supports_llm INTEGER,
+                last_attestation INTEGER
+            )
+            """
+        )
+
+
+def test_gpu_attest_bogus_signature_cannot_overwrite(tmp_path):
+    """Regression test: a bogus ed25519 signature must not allow overwriting
+    another miner's attestation. This was the v1 bug where _require_miner_signature()
+    ran before body parsing and never actually verified the signature.
+    """
+    from nacl.signing import SigningKey
+
+    db_path = tmp_path / "attest.db"
+    _init_attest_db(db_path)
+    client = _create_app(db_path).test_client()
+
+    # Create two keypairs: victim (legit) and attacker (bogus)
+    victim_sk = SigningKey.generate()
+    victim_pk_hex = victim_sk.verify_key.encode().hex()
+    attacker_sk = SigningKey.generate()
+    attacker_pk_hex = attacker_sk.verify_key.encode().hex()
+
+    import time as _time
+    ts = int(_time.time())
+
+    # Victim posts a legitimate attestation with a valid signature
+    victim_payload = "attest:" + victim_pk_hex + ":" + str(ts)
+    victim_sig = victim_sk.sign(victim_payload.encode()).signature.hex()
+
+    legit = client.post(
+        "/api/gpu/attest",
+        json={
+            "miner_id": victim_pk_hex,
+            "gpu_model": "NVIDIA A100",
+            "vram_gb": 80,
+            "benchmark_score": 9000,
+            "price_render_minute": 0.5,
+            "price_tts_1k_chars": 0.1,
+            "price_stt_minute": 0.2,
+            "price_llm_1k_tokens": 0.05,
+        },
+        headers={
+            "X-Miner-Signature": victim_sig,
+            "X-Miner-Timestamp": str(ts),
+        },
+    )
+    assert legit.status_code == 200
+    assert legit.get_json()["ok"] is True
+
+    # Attacker tries to overwrite victim's attestation using their OWN signature
+    # (not the victim's). This MUST fail with 401.
+    attacker_payload = "attest:" + victim_pk_hex + ":" + str(ts)
+    bogus_sig = attacker_sk.sign(attacker_payload.encode()).signature.hex()
+
+    overwrite = client.post(
+        "/api/gpu/attest",
+        json={
+            "miner_id": victim_pk_hex,
+            "gpu_model": "FAKE GPU",
+            "vram_gb": 1,
+            "benchmark_score": 0,
+            "price_render_minute": 0.0,
+            "price_tts_1k_chars": 0.0,
+            "price_stt_minute": 0.0,
+            "price_llm_1k_tokens": 0.0,
+        },
+        headers={
+            "X-Miner-Signature": bogus_sig,
+            "X-Miner-Timestamp": str(ts),
+        },
+    )
+    assert overwrite.status_code == 401
+    assert overwrite.get_json() == {"error": "Invalid miner signature"}
+
+    # Verify victim's original attestation is unchanged
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT gpu_model FROM gpu_attestations WHERE miner_id = ?",
+            (victim_pk_hex,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "NVIDIA A100"
+
+
+def test_gpu_attest_non_pubkey_miner_id_requires_admin(tmp_path):
+    """Non-hex miner_id (e.g. 'alice') requires admin key as fallback."""
+    db_path = tmp_path / "attest.db"
+    _init_attest_db(db_path)
+    client = _create_app(db_path).test_client()
+
+    # Without any auth, should fail
+    no_auth = client.post(
+        "/api/gpu/attest",
+        json={"miner_id": "alice", "gpu_model": "GTX 1080"},
+    )
+    assert no_auth.status_code == 401
+
+    # With admin key, should succeed
+    with_admin = client.post(
+        "/api/gpu/attest",
+        json={"miner_id": "alice", "gpu_model": "GTX 1080"},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert with_admin.status_code == 200

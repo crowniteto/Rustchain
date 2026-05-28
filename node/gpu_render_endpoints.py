@@ -63,29 +63,31 @@ def register_gpu_render_endpoints(app, db_path, admin_key):
             return jsonify({"error": "Unauthorized - admin key required"}), 401
         return None
 
-    def _require_miner_signature():
+    def _require_miner_signature(miner_id):
         """Verify that the requester controls the miner_id they're attesting as.
 
-        Bug: /api/gpu/attest previously had NO authentication, allowing any
-        attacker to overwrite any miner's GPU attestation data. This enables:
-        1. Replacing pricing with 0 to steal jobs from other miners
-        2. Registering fake GPU capabilities (claiming A100 when running nothing)
-        3. Denial-of-service by overwriting legitimate attestations
+        Bug (v1): _require_miner_signature() ran before the request body was
+        parsed, so it had no miner_id context. It only validated the timestamp
+        and returned None, leaving the actual signature verification to a
+        caller that never performed it. An unauthenticated attacker could
+        overwrite any miner's attestation by sending any arbitrary signature
+        plus a current timestamp.
 
-        Fix: require X-Miner-Signature header proving control of miner_id.
-        The signature covers "attest:<miner_id>:<timestamp>" and is verified
-        against the miner's registered public key. Falls back to admin key
-        if the miner has no registered key yet (first attestation).
+        Fix (v2): miner_id is now passed in after body parsing. The signature
+        covers "attest:<miner_id>:<timestamp>" and is verified against the
+        miner_id itself as an ed25519 public key (standard Rustchain identity).
+        Falls back to admin key if miner_id is not a valid hex pubkey (first
+        attestation / test scenarios).
         """
         sig = request.headers.get("X-Miner-Signature")
         ts_raw = request.headers.get("X-Miner-Timestamp")
         if not sig or not ts_raw:
-            # Fallback: allow with admin key for initial setup
+            # Fallback: allow with admin key for initial setup or test miners
             admin_err = _require_admin_key()
             if admin_err:
                 return jsonify({
                     "error": "Authentication required: provide either X-Miner-Signature + "
-                    "X-Miner-Timestamp headers, or X-Admin-Key"
+                             "X-Miner-Timestamp headers, or X-Admin-Key"
                 }), 401
             return None
 
@@ -97,7 +99,31 @@ def register_gpu_render_endpoints(app, db_path, admin_key):
         if abs(time.time() - ts) > 300:  # 5-minute skew tolerance
             return jsonify({"error": "Timestamp skew too large"}), 401
 
-        return None  # Signature verified by caller using miner_id context
+        # If miner_id is not a valid 64-char hex ed25519 public key,
+        # allow with admin key fallback (test miners like "alice")
+        try:
+            pubkey_bytes = bytes.fromhex(miner_id)
+            if len(pubkey_bytes) != 32:
+                raise ValueError("not 32 bytes")
+        except ValueError:
+            admin_err = _require_admin_key()
+            if admin_err:
+                return jsonify({
+                    "error": "miner_id is not a valid ed25519 public key; "
+                             "admin key required for non-pubkey miner IDs"
+                }), 401
+            return None
+
+        # Verify ed25519 signature over "attest:<miner_id>:<timestamp>"
+        try:
+            from nacl.signing import VerifyKey
+            from nacl.exceptions import BadSignatureError
+            verify_key = VerifyKey(pubkey_bytes)
+            message = f"attest:{miner_id}:{ts}".encode()
+            verify_key.verify(message, bytes.fromhex(sig))
+            return None  # Signature is valid
+        except (BadSignatureError, Exception):
+            return jsonify({"error": "Invalid miner signature"}), 401
 
     def _ensure_escrow_secret_column(db):
         """Best-effort migration for older DBs."""
@@ -112,11 +138,7 @@ def register_gpu_render_endpoints(app, db_path, admin_key):
     # 1. GPU Node Attestation (Extension)
     @app.route("/api/gpu/attest", methods=["POST"])
     def gpu_attest():
-        # FIX: Add authentication to prevent unauthorized attestation overwrite
-        auth_error = _require_miner_signature()
-        if auth_error:
-            return auth_error
-
+        # Parse body first so we have miner_id for auth
         data, body_error = _json_object_body()
         if body_error:
             return body_error
@@ -125,6 +147,13 @@ def register_gpu_render_endpoints(app, db_path, admin_key):
             return field_error
         if not miner_id:
             return jsonify({"error": "miner_id required"}), 400
+
+        # FIX v2: Auth now receives miner_id so it can verify the signature
+        # against the correct public key. Previously auth ran before body
+        # parsing, so signature verification was skipped entirely.
+        auth_error = _require_miner_signature(miner_id)
+        if auth_error:
+            return auth_error
 
         # Validate numeric fields to prevent negative/absurd values
         vram_gb = data.get("vram_gb")
@@ -146,7 +175,7 @@ def register_gpu_render_endpoints(app, db_path, admin_key):
 
         # Validate pricing fields are non-negative
         for price_field in ["price_render_minute", "price_tts_1k_chars",
-                           "price_stt_minute", "price_llm_1k_tokens"]:
+                            "price_stt_minute", "price_llm_1k_tokens"]:
             val = data.get(price_field, 0)
             try:
                 val = float(val)
